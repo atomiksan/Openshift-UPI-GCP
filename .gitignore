@@ -1,0 +1,30 @@
+# --- Secrets & Keys (KEEP OUT OF GIT) ---
+*.json
+pull-secret
+.secrets/
+auth/
+*.ign
+.gcloud
+application_default_credentials.json
+
+# --- Terraform State (KEEP OUT OF GIT) ---
+.terraform/
+tfout
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfplan
+
+# --- Environment Local Overrides ---
+.env
+.envrc.local
+# Note: Keep .envrc in git if it's generic, 
+# but ignore it if it contains private paths.
+
+# --- Large Binaries ---
+images/
+bin/openshift-install
+
+# --- Nix ---
+# DO NOT ignore flake.lock
+.direnv/
