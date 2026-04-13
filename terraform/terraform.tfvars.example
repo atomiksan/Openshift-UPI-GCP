@@ -1,0 +1,28 @@
+project_id = "my-gcp-project"
+region     = "us-central1"
+zone       = "us-central1-a"
+
+cluster_id  = "ocp-lab"
+base_domain = "ocp.example.com"
+
+rhcos_image = "projects/my-gcp-project/global/images/rhcos-421"
+
+# Leave null to use ADC/gcloud credentials:
+# gcloud auth application-default login
+credentials_file = null
+
+# Optional: use a dedicated service account for the OpenShift nodes.
+service_account_email = null
+
+# File mode is the simplest single-apply flow after you generate ignition files.
+ignition_mode = "file"
+ignition_dir  = "../ocp-install-config"
+
+# URL mode is useful if your ignition files exceed metadata size limits.
+# ignition_mode     = "url"
+# ignition_base_url = "http://10.0.0.10:8080/ignition"
+
+admin_source_ranges = ["0.0.0.0/0"]
+
+haproxy_stats_user     = "admin"
+haproxy_stats_password = "change-me"
