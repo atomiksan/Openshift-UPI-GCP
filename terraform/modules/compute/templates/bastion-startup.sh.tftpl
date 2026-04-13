@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if command -v apt-get >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y apache2 haproxy
+  sed -i 's/^Listen 80$/Listen 8080/' /etc/apache2/ports.conf
+  sed -i 's/<VirtualHost \*:80>/<VirtualHost *:8080>/' /etc/apache2/sites-enabled/000-default.conf
+  systemctl enable --now apache2
+elif command -v dnf >/dev/null 2>&1; then
+  dnf install -y httpd haproxy
+  sed -i 's/^Listen 80$/Listen 8080/' /etc/httpd/conf/httpd.conf
+  systemctl enable --now httpd
+elif command -v yum >/dev/null 2>&1; then
+  yum install -y httpd haproxy
+  sed -i 's/^Listen 80$/Listen 8080/' /etc/httpd/conf/httpd.conf
+  systemctl enable --now httpd
+fi
+
+mkdir -p /var/www/html/ignition
+
+cat >/etc/haproxy/haproxy.cfg <<CFG
+global
+    log 127.0.0.1 local2
+    chroot /var/lib/haproxy
+    pidfile /var/run/haproxy.pid
+    maxconn 4000
+    user haproxy
+    group haproxy
+    daemon
+
+defaults
+    mode tcp
+    log global
+    option tcplog
+    option dontlognull
+    retries 3
+    timeout http-request 10s
+    timeout queue 1m
+    timeout connect 10s
+    timeout client 1m
+    timeout server 1m
+    timeout check 10s
+    maxconn 3000
+
+listen stats
+    bind :9000
+    mode http
+    stats enable
+    stats uri /
+    stats refresh 5s
+    stats auth ${haproxy_stats_user}:${haproxy_stats_password}
+
+frontend api
+    bind *:6443
+    default_backend api_backend
+
+backend api_backend
+    balance roundrobin
+    server bootstrap ${bootstrap_ip}:6443 check
+    server master0 ${master0_ip}:6443 check
+    server master1 ${master1_ip}:6443 check
+    server master2 ${master2_ip}:6443 check
+
+frontend machine_config
+    bind *:22623
+    default_backend machine_config_backend
+
+backend machine_config_backend
+    balance roundrobin
+    server bootstrap ${bootstrap_ip}:22623 check
+    server master0 ${master0_ip}:22623 check
+    server master1 ${master1_ip}:22623 check
+    server master2 ${master2_ip}:22623 check
+
+frontend ingress_http
+    bind *:80
+    default_backend ingress_http_backend
+
+backend ingress_http_backend
+    balance roundrobin
+    server master0 ${master0_ip}:80 check
+    server master1 ${master1_ip}:80 check
+    server master2 ${master2_ip}:80 check
+
+frontend ingress_https
+    bind *:443
+    default_backend ingress_https_backend
+
+backend ingress_https_backend
+    balance roundrobin
+    server master0 ${master0_ip}:443 check
+    server master1 ${master1_ip}:443 check
+    server master2 ${master2_ip}:443 check
+CFG
+
+systemctl enable --now haproxy
+systemctl restart haproxy
