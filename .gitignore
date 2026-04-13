@@ -1,5 +1,8 @@
 # --- Secrets & Keys (KEEP OUT OF GIT) ---
 *.json
+!bootstrap-ptr.json
+!master-ptr.json
+!worker-ptr.json
 pull-secret
 .secrets/
 auth/
