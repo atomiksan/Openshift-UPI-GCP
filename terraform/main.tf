@@ -1,68 +1,130 @@
 provider "google" {
   project     = var.project_id
   region      = var.region
-  credentials = file("${path.root}/../ocp-sa-key.json")
+  credentials = var.credentials_file == null ? null : file(var.credentials_file)
 }
 
-# 1. Create Network (VPC, Subnets, NAT)
+locals {
+  cluster_domain = "${var.cluster_id}.${var.base_domain}"
+
+  node_a_records = {
+    bastion   = module.network.reserved_ips["bastion"]
+    bootstrap = module.network.reserved_ips["bootstrap"]
+    master0   = module.network.reserved_ips["master0"]
+    master1   = module.network.reserved_ips["master1"]
+    master2   = module.network.reserved_ips["master2"]
+    worker0   = module.network.reserved_ips["worker0"]
+    worker1   = module.network.reserved_ips["worker1"]
+  }
+
+  load_balanced_a_records = {
+    api       = module.network.reserved_ips["bastion"]
+    "api-int" = module.network.reserved_ips["bastion"]
+  }
+}
+
 module "network" {
-  source      = "./modules/network"
-  project_id  = var.project_id
-  region      = var.region
-  cluster_id  = var.cluster_id
-  base_domain = var.base_domain
+  source              = "./modules/network"
+  project_id          = var.project_id
+  region              = var.region
+  cluster_id          = var.cluster_id
+  cluster_domain      = local.cluster_domain
+  subnet_cidr         = var.subnet_cidr
+  reserved_ips        = var.reserved_ips
+  admin_source_ranges = var.admin_source_ranges
 }
 
-# 2. Create Compute (Bootstrap & Masters)
+resource "google_dns_record_set" "node_a" {
+  for_each = local.node_a_records
+
+  name         = "${each.key}.${local.cluster_domain}."
+  type         = "A"
+  ttl          = 60
+  managed_zone = module.network.private_zone_name
+  rrdatas      = [each.value]
+}
+
+resource "google_dns_record_set" "load_balanced_a" {
+  for_each = local.load_balanced_a_records
+
+  name         = "${each.key}.${local.cluster_domain}."
+  type         = "A"
+  ttl          = 60
+  managed_zone = module.network.private_zone_name
+  rrdatas      = [each.value]
+}
+
+resource "google_dns_record_set" "apps_wildcard" {
+  name         = "*.apps.${local.cluster_domain}."
+  type         = "A"
+  ttl          = 60
+  managed_zone = module.network.private_zone_name
+  rrdatas      = [module.network.reserved_ips["bastion"]]
+}
+
+resource "google_dns_record_set" "etcd_srv" {
+  name         = "_etcd-server-ssl._tcp.${local.cluster_domain}."
+  type         = "SRV"
+  ttl          = 60
+  managed_zone = module.network.private_zone_name
+  rrdatas = [
+    "0 10 2380 master0.${local.cluster_domain}.",
+    "0 10 2380 master1.${local.cluster_domain}.",
+    "0 10 2380 master2.${local.cluster_domain}.",
+  ]
+}
+
 module "compute" {
-  source          = "./modules/compute"
-  project_id      = var.project_id
-  region          = var.region
-  cluster_id      = var.cluster_id
-  nodes_subnet_id = module.network.nodes_subnet_id
-  rhcos_image     = "projects/vernal-branch-484810-p6/global/images/rhcos-420"
+  source                   = "./modules/compute"
+  project_id               = var.project_id
+  region                   = var.region
+  zone                     = var.zone
+  cluster_id               = var.cluster_id
+  nodes_subnet_id          = module.network.nodes_subnet_id
+  reserved_ips             = module.network.reserved_ips
+  rhcos_image              = var.rhcos_image
+  bastion_image            = var.bastion_image
+  service_account_email    = var.service_account_email
+  ignition_mode            = var.ignition_mode
+  ignition_base_url        = var.ignition_base_url
+  ignition_version         = var.ignition_version
+  ignition_dir             = abspath("${path.root}/${var.ignition_dir}")
+  bastion_enable_public_ip = var.bastion_enable_public_ip
+  haproxy_stats_user       = var.haproxy_stats_user
+  haproxy_stats_password   = var.haproxy_stats_password
+
+  depends_on = [
+    google_dns_record_set.apps_wildcard,
+    google_dns_record_set.etcd_srv,
+    google_dns_record_set.load_balanced_a,
+    google_dns_record_set.node_a,
+  ]
 }
 
-# 3. DNS Records (Moved here to break the cycle)
-resource "google_dns_record_set" "api" {
-  name         = "api.${var.cluster_id}.ocp.${var.base_domain}."
-  type         = "A"
-  ttl          = 60
-  managed_zone = module.network.zone_name
-  # Point to Bootstrap PUBLIC IP + Master PUBLIC IPs (if they had any, but they don't)
-  # For UPI on GCP without a real LB, we at least keep bootstrap here.
-  # If masters were public, we'd add them. Since they are private, external 'api' usually stays on bootstrap.
-  rrdatas      = [module.compute.bootstrap_public_ip]
+output "cluster_domain" {
+  value = local.cluster_domain
 }
 
-resource "google_dns_record_set" "api_int" {
-  name         = "api-int.${var.cluster_id}.ocp.${var.base_domain}."
-  type         = "A"
-  ttl          = 60
-  managed_zone = module.network.private_zone_name
-  # Round-robin: Bootstrap IP + All Master IPs
-  rrdatas      = concat([module.compute.bootstrap_private_ip], module.compute.master_private_ips)
+output "reserved_ips" {
+  value = module.network.reserved_ips
 }
 
-resource "google_dns_record_set" "master" {
-  count        = 3
-  name         = "master-${count.index}.ocp.${var.base_domain}."
-  type         = "A"
-  ttl          = 60
-  managed_zone = module.network.private_zone_name
-  rrdatas      = [module.compute.master_private_ips[count.index]]
+output "bastion_public_ip" {
+  value = module.compute.bastion_public_ip
 }
 
-resource "google_dns_record_set" "apps" {
-  name         = "*.apps.${var.cluster_id}.ocp.${var.base_domain}."
-  type         = "A"
-  ttl          = 300
-  managed_zone = module.network.zone_name
-  # Pointing to Bootstrap Public IP so you can reach the console later
-  rrdatas      = [module.compute.bootstrap_public_ip] 
+output "bastion_private_ip" {
+  value = module.compute.bastion_private_ip
 }
 
+output "bootstrap_private_ip" {
+  value = module.compute.bootstrap_private_ip
+}
 
-output "nameservers" {
-  value = module.network.nameservers
+output "master_private_ips" {
+  value = module.compute.master_private_ips
+}
+
+output "worker_private_ips" {
+  value = module.compute.worker_private_ips
 }
