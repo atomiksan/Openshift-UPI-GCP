@@ -5,20 +5,21 @@ resource "google_compute_network" "vpc" {
 
 resource "google_compute_subnetwork" "nodes_subnet" {
   name          = "${var.cluster_id}-nodes-subnet"
-  ip_cidr_range = "10.0.0.0/24"
+  ip_cidr_range = var.subnet_cidr
   region        = var.region
   network       = google_compute_network.vpc.self_link
 }
 
-resource "google_dns_managed_zone" "ocp_zone" {
-  name        = "${var.cluster_id}-zone"
-  dns_name    = "ocp.${var.base_domain}."
-  visibility  = "public"
-  
-  //lifecycle { prevent_destroy = true }
+resource "google_compute_address" "reserved" {
+  for_each = var.reserved_ips
+
+  name         = "${var.cluster_id}-${each.key}-ip"
+  address_type = "INTERNAL"
+  address      = each.value
+  region       = var.region
+  subnetwork   = google_compute_subnetwork.nodes_subnet.id
 }
 
-# --- CLOUD NAT (The fix for the pull errors) ---
 resource "google_compute_router" "router" {
   name    = "${var.cluster_id}-router"
   region  = var.region
@@ -34,10 +35,10 @@ resource "google_compute_router_nat" "nat" {
 }
 
 resource "google_dns_managed_zone" "ocp_private_zone" {
-  name        = "${var.cluster_id}-private-zone"
-  dns_name    = "ocp.${var.base_domain}."
-  visibility  = "private"
-  
+  name       = "${var.cluster_id}-private-zone"
+  dns_name   = "${var.cluster_domain}."
+  visibility = "private"
+
   private_visibility_config {
     networks {
       network_url = google_compute_network.vpc.id
@@ -48,24 +49,31 @@ resource "google_dns_managed_zone" "ocp_private_zone" {
 resource "google_compute_firewall" "internal" {
   name    = "${var.cluster_id}-allow-internal"
   network = google_compute_network.vpc.name
+
   allow { protocol = "icmp" }
+
   allow {
     protocol = "tcp"
     ports    = ["0-65535"]
   }
+
   allow {
     protocol = "udp"
     ports    = ["0-65535"]
   }
-  source_ranges = ["10.0.0.0/24"]
+
+  source_ranges = [var.subnet_cidr]
 }
 
-resource "google_compute_firewall" "external" {
-  name    = "${var.cluster_id}-allow-external"
-  network = google_compute_network.vpc.name
+resource "google_compute_firewall" "bastion_ingress" {
+  name        = "${var.cluster_id}-allow-bastion-ingress"
+  network     = google_compute_network.vpc.name
+  target_tags = ["${var.cluster_id}-bastion"]
+
   allow {
     protocol = "tcp"
-    ports    = ["6443", "22623", "22", "80", "443"] 
+    ports    = ["22", "80", "443", "6443", "22623", "8080", "9000"]
   }
-  source_ranges = ["0.0.0.0/0"]
+
+  source_ranges = var.admin_source_ranges
 }
