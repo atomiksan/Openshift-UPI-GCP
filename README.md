@@ -1,756 +1,245 @@
+# OpenShift UPI on GCP
 
----
+Terraform for a small OpenShift UPI lab on Google Cloud Platform.
 
-# 🚀 OpenShift 4.21 UPI on GCP – Master-Only Cluster
+The layout creates:
 
-**User-Provisioned Infrastructure (UPI)** installation of OpenShift 4.21 on Google Cloud Platform using:
+- One custom VPC and subnet.
+- Reserved private IP addresses for bastion, bootstrap, masters, and workers.
+- Private Cloud DNS records for OpenShift.
+- Firewall rules for internal cluster traffic and bastion access.
+- Cloud Router and Cloud NAT for private instance egress.
+- One bastion/load balancer VM.
+- One bootstrap VM, three master VMs, and two worker VMs with no external IPs.
 
-* Custom VPC
-* Cloud NAT
-* Private DNS
-* Bastion with HAProxy
-* Apache httpd for Ignition
-* Master-only topology (no workers)
+## Network Layout
 
----
+| Role | Private IP | DNS name |
+| --- | --- | --- |
+| Bastion / HAProxy | `10.0.0.10` | `bastion.<cluster_id>.<base_domain>` |
+| Master 0 | `10.0.0.11` | `master0.<cluster_id>.<base_domain>` |
+| Master 1 | `10.0.0.12` | `master1.<cluster_id>.<base_domain>` |
+| Master 2 | `10.0.0.13` | `master2.<cluster_id>.<base_domain>` |
+| Worker 0 | `10.0.0.14` | `worker0.<cluster_id>.<base_domain>` |
+| Worker 1 | `10.0.0.15` | `worker1.<cluster_id>.<base_domain>` |
+| Bootstrap | `10.0.0.20` | `bootstrap.<cluster_id>.<base_domain>` |
 
-# 📦 1. Required Downloads
+The default cluster domain is:
 
-Download to your workstation or Bastion:
-
-* OpenShift Installer 4.21
-* OpenShift CLI (`oc`)
-* RHCOS GCP image
-
-Upload RHCOS image to GCP and create a custom image:
-
+```text
+ocp-lab.ocp.satyabrata.net
 ```
-rhcos-421
-```
 
----
+The following OpenShift records are created in private Cloud DNS:
 
-# 🌐 2. Infrastructure Setup
+- `api.<cluster_domain>` -> `10.0.0.10`
+- `api-int.<cluster_domain>` -> `10.0.0.10`
+- `*.apps.<cluster_domain>` -> `10.0.0.10`
+- `bastion.<cluster_domain>` -> `10.0.0.10`
+- `bootstrap.<cluster_domain>` -> `10.0.0.20`
+- `master0.<cluster_domain>` -> `10.0.0.11`
+- `master1.<cluster_domain>` -> `10.0.0.12`
+- `master2.<cluster_domain>` -> `10.0.0.13`
+- `worker0.<cluster_domain>` -> `10.0.0.14`
+- `worker1.<cluster_domain>` -> `10.0.0.15`
+- `_etcd-server-ssl._tcp.<cluster_domain>` SRV records for the three masters.
 
----
+## Prerequisites
 
-## 2.1 Create VPC & Subnet
+Install or enter the Nix dev shell:
 
 ```bash
-gcloud compute networks create ocp-network \
-  --subnet-mode=custom \
-  --project=vernal-branch-484810-p6
-
-gcloud compute networks subnets create ocp-subnet \
-  --network=ocp-network \
-  --range=10.0.0.0/24 \
-  --region=us-central1 \
-  --project=vernal-branch-484810-p6
+nix develop
 ```
 
----
+You also need:
 
-## 2.2 Cloud NAT
+- A GCP project with Compute Engine, Cloud DNS, IAM, and Cloud NAT APIs enabled.
+- GCP credentials. ADC is easiest:
 
 ```bash
-gcloud compute routers create ocp-router \
-  --network=ocp-network \
-  --region=us-central1
-
-gcloud compute routers nats create ocp-nat \
-  --router=ocp-router \
-  --region=us-central1 \
-  --auto-allocate-nat-external-ips \
-  --nat-all-subnet-ip-ranges
+gcloud auth application-default login
+gcloud config set project <project_id>
 ```
 
----
+- An RHCOS image imported into your project.
+- `openshift-install` and `oc`.
+- A valid pull secret and SSH public key.
 
-# 🌍 2.3 Private DNS Configuration
+## Configure Terraform
 
-Create zone:
+Create your local variables file:
 
 ```bash
-gcloud dns managed-zones create ocp-private-zone \
-  --dns-name=ocp-lab.ocp.satyabrata.net. \
-  --description="OpenShift Private Zone" \
-  --visibility=private \
-  --networks=ocp-network
+cp terraform/terraform.tfvars.example terraform/terraform.tfvars
 ```
 
-Start transaction:
+Edit at least:
+
+```hcl
+project_id  = "my-gcp-project"
+base_domain = "ocp.example.com"
+rhcos_image = "projects/my-gcp-project/global/images/rhcos-421"
+```
+
+Leave `credentials_file = null` to use ADC/gcloud credentials. If you prefer a service account key, set:
+
+```hcl
+credentials_file = "../ocp-sa-key.json"
+```
+
+Keep private values out of git. Terraform state and `*.tfvars` files are ignored.
+
+## Generate OpenShift Ignition
+
+Start from the sample config:
 
 ```bash
-gcloud dns record-sets transaction start --zone=ocp-private-zone
+cp ocp-install-config/install-config.yaml /tmp/ocp-install/install-config.yaml
 ```
 
----
+Edit `/tmp/ocp-install/install-config.yaml` and set:
 
-## 🔹 Node Records
+- `baseDomain`
+- `metadata.name`
+- `pullSecret`
+- `sshKey`
 
-```bash
-# Bootstrap
-gcloud dns record-sets transaction add 10.0.0.50 \
-  --name=bootstrap.ocp-lab.ocp.satyabrata.net. \
-  --ttl=60 --type=A --zone=ocp-private-zone
-
-# Masters
-gcloud dns record-sets transaction add 10.0.0.20 \
-  --name=master0.ocp-lab.ocp.satyabrata.net. \
-  --ttl=60 --type=A --zone=ocp-private-zone
-
-gcloud dns record-sets transaction add 10.0.0.30 \
-  --name=master1.ocp-lab.ocp.satyabrata.net. \
-  --ttl=60 --type=A --zone=ocp-private-zone
-
-gcloud dns record-sets transaction add 10.0.0.40 \
-  --name=master2.ocp-lab.ocp.satyabrata.net. \
-  --ttl=60 --type=A --zone=ocp-private-zone
-```
-
----
-
-## 🔹 API & Internal API
-
-```bash
-gcloud dns record-sets transaction add 10.0.0.10 \
-  --name=api.ocp-lab.ocp.satyabrata.net. \
-  --ttl=60 --type=A --zone=ocp-private-zone
-
-gcloud dns record-sets transaction add 10.0.0.10 \
-  --name=api-int.ocp-lab.ocp.satyabrata.net. \
-  --ttl=60 --type=A --zone=ocp-private-zone
-```
-
----
-
-## 🔹 Wildcard Apps Record
-
-```bash
-gcloud dns record-sets transaction add 10.0.0.10 \
-  --name=*.apps.ocp-lab.ocp.satyabrata.net. \
-  --ttl=60 --type=A --zone=ocp-private-zone
-```
-
-Execute:
-
-```bash
-gcloud dns record-sets transaction execute --zone=ocp-private-zone
-```
-
----
-
-# 🔥 3. Firewall Rules
-
-```bash
-gcloud compute firewall-rules create ocp-allow-internal \
-  --network=ocp-network \
-  --allow all \
-  --source-ranges=10.0.0.0/24
-
-gcloud compute firewall-rules create ocp-allow-control-plane \
-  --network=ocp-network \
-  --allow tcp:6443,tcp:22623 \
-  --source-ranges=0.0.0.0/0 \
-  --target-tags=bastion-vm
-
-gcloud compute firewall-rules create ocp-allow-ingress \
-  --network=ocp-network \
-  --allow tcp:80,tcp:443,tcp:9000 \
-  --source-ranges=0.0.0.0/0 \
-  --target-tags=bastion-vm
-
-gcloud compute firewall-rules create ocp-allow-ssh \
-  --network=ocp-network \
-  --allow tcp:22 \
-  --source-ranges=0.0.0.0/0
-```
-
----
-
-# 📝 4. OpenShift Config
-
-## install-config.yaml
+For the default Terraform variables, keep:
 
 ```yaml
-apiVersion: v1
 baseDomain: ocp.satyabrata.net
-compute:
-- hyperthreading: Enabled
-  name: worker
-  replicas: 0
-controlPlane:
-  hyperthreading: Enabled
-  name: master
-  replicas: 3
 metadata:
   name: ocp-lab
-networking:
-  clusterNetwork:
-  - cidr: 10.128.0.0/14
-    hostPrefix: 23
-  networkType: OVNKubernetes
-  serviceNetwork:
-  - 172.30.0.0/16
+compute:
+- name: worker
+  replicas: 2
+controlPlane:
+  name: master
+  replicas: 3
 platform:
   none: {}
-fips: false
-pullSecret: '{"auths": ...}' ##Put your pull secret here
-sshKey: 'ssh-ed25519 AAAA...' ##Put your ssh key here
 ```
 
-Generate ignition files:
+Create ignition files:
 
 ```bash
-openshift-install create ignition-configs --dir=<your config directory>
+openshift-install create ignition-configs --dir=/tmp/ocp-install
 ```
 
----
+You should now have:
 
-# 🌐 5. Apache httpd for Ignition
+```text
+/tmp/ocp-install/bootstrap.ign
+/tmp/ocp-install/master.ign
+/tmp/ocp-install/worker.ign
+```
 
-Install:
+## Choose Ignition Mode
+
+The example variables use file mode:
+
+```hcl
+ignition_mode = "file"
+ignition_dir  = "../ocp-install-config"
+```
+
+Copy the generated ignition files into `ocp-install-config/` before `terraform apply`:
 
 ```bash
-sudo yum install -y httpd
+cp /tmp/ocp-install/bootstrap.ign ocp-install-config/bootstrap.ign
+cp /tmp/ocp-install/master.ign ocp-install-config/master.ign
+cp /tmp/ocp-install/worker.ign ocp-install-config/worker.ign
 ```
 
-Setup:
+The ignition files are ignored by git.
+
+URL mode is available if your ignition files exceed GCP metadata size limits:
+
+```hcl
+ignition_mode     = "url"
+ignition_base_url = "http://10.0.0.10:8080/ignition"
+```
+
+URL mode sends small pointer configs in instance metadata. The bastion starts Apache on port `8080`, but you must place the generated ignition files on the bastion before the OpenShift nodes boot successfully:
+
+```text
+/var/www/html/ignition/bootstrap.ign
+/var/www/html/ignition/master.ign
+/var/www/html/ignition/worker.ign
+```
+
+## Apply
+
+Initialize and review:
 
 ```bash
-sudo mkdir -p /var/www/html/ignition
-sudo cp *.ign /var/www/html/ignition/
-sudo chown -R apache:apache /var/www/html
-
-# Change httpd port to 8080
-sudo sed -i 's/Listen 80/Listen 8080/' /etc/httpd/conf/httpd.conf
-
-# Allow HTTP traffic permanently
-sudo firewall-cmd --permanent --add-service=http
-
-# Reload the firewall to apply changes
-sudo firewall-cmd --reload
-
-# Apply the correct SELinux context for web content
-sudo restorecon -Rv /var/www/html/ocp4
+terraform -chdir=terraform init
+terraform -chdir=terraform plan
 ```
 
-Enable:
+Create the infrastructure:
 
 ```bash
-sudo systemctl enable httpd
-sudo systemctl start httpd
+terraform -chdir=terraform apply
 ```
 
-Test:
+After apply, Terraform prints the bastion public IP when `bastion_enable_public_ip = true`.
 
-```
-curl -I http://10.0.0.10:8080/ignition/bootstrap.ign
-```
+## Bastion Services
 
----
+The bastion VM is configured by startup script.
 
-# ⚖️ 6. HAProxy Config
+It runs:
 
-`/etc/haproxy/haproxy.cfg`
+- HAProxy on `80`, `443`, `6443`, `22623`, and `9000`.
+- Apache on `8080` for ignition hosting.
 
-```haproxy
+HAProxy routes:
 
-global
-    log         127.0.0.1 local2
-    chroot      /var/lib/haproxy
-    pidfile     /var/run/haproxy.pid
-    maxconn     4000
-    user        haproxy
-    group       haproxy
-    daemon
+- `6443` to bootstrap and masters.
+- `22623` to bootstrap and masters.
+- `80` and `443` to masters.
 
-defaults
-    mode                    tcp
-    log                     global
-    option                  tcplog
-    option                  dontlognull
-    retries                 3
-    timeout http-request    10s
-    timeout queue           1m
-    timeout connect         10s
-    timeout client          1m
-    timeout server          1m
-    timeout check           10s
-    maxconn                 3000
+Use the `haproxy_stats_user` and `haproxy_stats_password` variables to change the stats login.
 
-# ---------------------------------------------------------------------
-# HAProxy Stats Page
-# ---------------------------------------------------------------------
-listen stats
-    bind :9000
-    mode http
-    stats enable
-    stats uri /
-    stats refresh 5s
-    stats auth admin:admin123
+## Verify DNS From Inside The VPC
 
-# ---------------------------------------------------------------------
-# API Server (Port 6443)
-# ---------------------------------------------------------------------
-frontend api-frontend
-    bind *:6443
-    default_backend api-backend
-
-backend api-backend
-    balance roundrobin
-    server bootstrap 10.0.0.50:6443 check
-    server master0   10.0.0.20:6443 check
-    server master1   10.0.0.30:6443 check
-    server master2   10.0.0.40:6443 check
-
-# ---------------------------------------------------------------------
-# Machine Config Server (Port 22623)
-# ---------------------------------------------------------------------
-frontend machine-config-frontend
-    bind *:22623
-    default_backend machine-config-backend
-
-backend machine-config-backend
-    balance roundrobin
-    server bootstrap 10.0.0.50:22623 check
-    server master0   10.0.0.20:22623 check
-    server master1   10.0.0.30:22623 check
-    server master2   10.0.0.40:22623 check
-
-# ---------------------------------------------------------------------
-# Ingress HTTP (Port 80)
-# ---------------------------------------------------------------------
-frontend ingress-http-frontend
-    bind *:80
-    default_backend ingress-http-backend
-
-backend ingress-http-backend
-    balance roundrobin
-    server master0 10.0.0.20:80 check
-    server master1 10.0.0.30:80 check
-    server master2 10.0.0.40:80 check
-
-# ---------------------------------------------------------------------
-# Ingress HTTPS (Port 443)
-# ---------------------------------------------------------------------
-frontend ingress-https-frontend
-    bind *:443
-    default_backend ingress-https-backend
-
-backend ingress-https-backend
-    balance roundrobin
-    server master0 10.0.0.20:443 check
-    server master1 10.0.0.30:443 check
-    server master2 10.0.0.40:443 check
-
-```
-
-Restart:
-
-```bash
-# Open ports in Firewalld
-sudo firewall-cmd --permanent --add-port={6443,22623,80,443}/tcp
-sudo firewall-cmd --reload
-
-# Allow HAProxy to make outbound connections (SELinux)
-sudo setsebool -P haproxy_connect_any 1
-
-# Start HAProxy
-sudo systemctl enable --now haproxy
-sudo systemctl restart haproxy
-```
-
----
-
-# 🧪 7. Final Pre-Provisioning Sanity Check (MANDATORY)
-
-⚠️ **Do NOT provision bootstrap or master nodes until all checks in this section pass.**
-
-This verifies:
-
-* DNS resolution (Cloud DNS Private Zone)
-* Resolver configuration (GCP metadata server)
-* HAProxy listening ports
-* Apache and HAProxy are not conflicting
-
----
-
-## 7.1 Install Required Tools
-
-If not already installed, install `bind-utils` to get `dig` and `nslookup`.
-
-```bash
-sudo dnf install -y bind-utils
-```
-
----
-
-## 7.2 Perform the “Identity Check” (DNS Validation)
-
-Since you're using **Google Cloud DNS Private Zones**, your Bastion should automatically resolve internal records.
-
-Run the following tests **from the Bastion**.
-
----
-
-### 🔹 Test the API (Load Balancer)
+From the bastion:
 
 ```bash
 dig +short api.ocp-lab.ocp.satyabrata.net
-```
-
-Expected result:
-
-```
-10.0.0.10
-```
-
----
-
-### 🔹 Test a Master Node
-
-```bash
+dig +short api-int.ocp-lab.ocp.satyabrata.net
 dig +short master0.ocp-lab.ocp.satyabrata.net
+dig +short worker0.ocp-lab.ocp.satyabrata.net
+dig +short -t SRV _etcd-server-ssl._tcp.ocp-lab.ocp.satyabrata.net
 ```
 
-Expected result:
+Expected key answers:
 
-```
-10.0.0.20
-```
-
----
-
-### 🔹 Test the Wildcard Apps Record
-
-```bash
-dig +short console-openshift-console.apps.ocp-lab.ocp.satyabrata.net
-```
-
-Expected result:
-
-```
+```text
 10.0.0.10
+10.0.0.11
+10.0.0.14
 ```
 
----
+## Complete OpenShift Install
 
-If any of these fail:
-
-* Verify DNS zone is attached to the correct VPC
-* Ensure you executed the DNS transaction
-* Confirm the Bastion is inside the same VPC
-
----
-
-## 7.3 Why This Works on CentOS 10
-
-CentOS 10 uses:
-
-* NetworkManager
-* systemd-resolved
-
-When your Bastion boots in GCP, it receives a DHCP lease that sets:
-
-```
-nameserver 169.254.169.254
-```
-
-This special IP is the **Google metadata server**, which provides access to:
-
-* Cloud DNS Private Zones
-* Internal name resolution
-
----
-
-### 🔎 Verify Resolver Configuration
+From the machine that has your generated install directory:
 
 ```bash
-cat /etc/resolv.conf
+openshift-install wait-for bootstrap-complete --dir=/tmp/ocp-install --log-level=info
+openshift-install wait-for install-complete --dir=/tmp/ocp-install --log-level=info
 ```
 
-You should see:
-
-```
-nameserver 169.254.169.254
-```
-
-If you do not:
-
-* Check NetworkManager status
-* Restart networking
-* Ensure no custom DNS override exists
-
----
-
-## 7.4 Verify HAProxy is Listening
-
-Since Apache is now serving ignition files, ensure it is not conflicting with HAProxy.
-
-Run:
+After bootstrap completes, remove the bootstrap instance:
 
 ```bash
-sudo ss -tunlp | grep -E '6443|22623|80|443'
+terraform -chdir=terraform destroy -target=module.compute.google_compute_instance.bootstrap
 ```
 
-You should see:
-
-* HAProxy listening on:
-
-  * 6443
-  * 22623
-  * 443
-* Apache listening on:
-
-  * 80
-
-If ports are missing:
+## Destroy
 
 ```bash
-sudo systemctl status haproxy
-sudo systemctl status httpd
+terraform -chdir=terraform destroy
 ```
-
-Restart if necessary:
-
-```bash
-sudo systemctl restart haproxy
-sudo systemctl restart httpd
-```
-
----
-
-# ✅ Final Confirmation Checklist
-
-Before proceeding to bootstrap:
-
-* [ ] API resolves correctly
-* [ ] Master node resolves correctly
-* [ ] Wildcard apps resolves correctly
-* [ ] `/etc/resolv.conf` points to 169.254.169.254
-* [ ] HAProxy listening on 6443, 22623, 443
-* [ ] Apache listening on 80
-* [ ] No port conflicts
-
----
-
-If all checks pass — you are cleared to provision bootstrap and master nodes.
-
----
-
-
-# 🛠 8. Provision Nodes
-
-Bootstrap:
-
-```bash
-gcloud compute instances create ocp-bootstrap \
-  --image=rhcos-421 \
-  --machine-type=n2-standard-4 \
-  --boot-disk-size=100GB \
-  --boot-disk-type=pd-ssd \
-  --network=ocp-network \
-  --subnet=ocp-subnet \
-  --private-network-ip=10.0.0.50 \
-  --metadata-from-file=user-data=bootstrap.ign
-```
-
-Repeat for masters.
-
----
-
-# 🌐 9. Configure Ingress for Master-Only Cluster (CRITICAL)
-
-Since this deployment uses **no worker nodes**, the default ingress controller will not schedule router pods unless explicitly told to run on masters.
-
-You must patch the default ingress controller to:
-
-* Use `HostNetwork`
-* Allow scheduling on master nodes
-* Add proper tolerations (`NoSchedule` and `NoExecute`)
-
----
-
-## Apply the Patch
-
-```bash
-oc patch ingresscontroller default \
-  -n openshift-ingress-operator \
-  --type=merge \
-  -p '{"spec":{"endpointPublishingStrategy":{"type":"HostNetwork"},"nodePlacement":{"nodeSelector":{"matchLabels":{"node-role.kubernetes.io/master":""}},"tolerations":[{"effect":"NoSchedule","key":"node-role.kubernetes.io/master","operator":"Exists"},{"effect":"NoExecute","key":"node-role.kubernetes.io/master","operator":"Exists"}]}}}'
-```
-
----
-
-## Verify Router Pods Are Running
-
-```bash
-oc get pods -n openshift-ingress -o wide
-```
-
-You should see router pods scheduled on:
-
-```
-master0
-master1
-master2
-```
-
----
-
-## Verify Ingress Operator Status
-
-```bash
-oc get co ingress
-```
-
-Expected:
-
-```
-Available=True
-Progressing=False
-Degraded=False
-```
-
----
-
-## Test Console Route
-
-```bash
-oc get route console -n openshift-console
-```
-
-Then test from Bastion:
-
-```bash
-curl -k https://console-openshift-console.apps.ocp-lab.ocp.satyabrata.net
-```
-
-If it loads (even with self-signed cert warning), ingress is working.
-
----
-
-# 🧠 Why This Is Required
-
-By default:
-
-* Masters are tainted with:
-
-  ```
-  node-role.kubernetes.io/master:NoSchedule
-  ```
-* Router pods expect worker nodes.
-
-Your patch:
-
-* Adds tolerations
-* Forces placement on masters
-* Uses host networking to bind directly to node IPs
-
-Without this patch:
-
-* `*.apps` DNS will resolve
-* HAProxy will forward traffic
-* But nothing will answer on port 443
-
-
----
-
-# 🔎 10. Deep Debugging Guide
-
-## Bootstrap Logs
-
-```bash
-journalctl -b -f -u release-image.service -u bootkube.service
-sudo systemctl status release-image.service
-```
-
-## Kubelet
-
-```bash
-journalctl -u kubelet -f
-```
-
-## etcd
-
-```bash
-etcdctl endpoint health
-```
-
-## API
-
-```bash
-curl -k https://api.ocp-lab.ocp.satyabrata.net:6443/version
-```
-
-## CSR
-
-```bash
-oc get csr
-oc get csr -o name | xargs oc adm certificate approve
-```
-
-## Check Operators
-
-```bash
-oc get co
-```
-
-## On the Masters
-
-```bash
-# Watch the Machine Config Daemon (the service that applies the configuration)
-journalctl -b -f -u machine-config-daemon-pull.service
-journalctl -b -u ignition-fetch-offline.service
-journalctl -b -f -u kubelet
-```
-
----
-
-# 🧨 11. Complete Bootstrap
-
-```bash
-openshift-install wait-for bootstrap-complete
-```
-
-Delete bootstrap:
-
-```bash
-gcloud compute instances delete ocp-bootstrap \
-  --zone=us-central1-c --quiet
-```
-
-Remove bootstrap from HAProxy backend.
-
----
-
-# 🧹 12. Teardown
-
-```bash
-gcloud compute instances delete \
-  ocp-master-0 ocp-master-1 ocp-master-2 bastion-0 \
-  --zone=us-central1-c --quiet
-
-gcloud compute networks delete ocp-network --quiet
-```
-
----
-
-# ✅ Validation
-
-```bash
-oc get nodes
-oc get co
-oc get pods -A
-```
-
-Expected:
-
-```
-Available=True
-Degraded=False
-Progressing=False
-```
-
----
