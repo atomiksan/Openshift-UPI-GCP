@@ -1,1 +1,12 @@
-{"ignition":{"version":"3.2.0","config":{"replace":{"source":"http://10.0.0.10:8080/ocp4/master.ign"}}}}
+{
+  "ignition": {
+    "version": "3.2.0",
+    "config": {
+      "merge": [
+        {
+          "source": "http://10.0.0.10:8080/ignition/master.ign"
+        }
+      ]
+    }
+  }
+}
